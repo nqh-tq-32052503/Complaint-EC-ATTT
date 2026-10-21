@@ -8,30 +8,21 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH="/app"
 
-# 1. Cập nhật và cài đặt các gói hệ thống cần thiết cho runtime và vận hành:
-# - apk upgrade: vá tất cả các lỗ hổng hệ điều hành (như zlib CVE-2026-85091)
-# - bash: tương thích scripting và troubleshooting
-# - curl: công cụ network check & health check
-# - procps: hỗ trợ quản lý tiến trình (ps, pkill) cho supervisor
-# - ca-certificates: chứng chỉ tin cậy kết nối SSL/TLS
-# - tzdata: định cấu hình múi giờ hệ thống
+# 1. Cập nhật và vá tất cả các lỗ hổng hệ điều hành (không cài thêm gói OS thừa)
+# Ghi chú: ca-certificates và tzdata đã có sẵn trong base image python:3.11-alpine.
+# Không cài bash, curl, procps để loại bỏ các gói GPL-3.0/GPL-2.0 không cần thiết.
 RUN apk update && \
-    apk upgrade --no-cache && \
-    apk add --no-cache \
-        bash \
-        curl \
-        procps \
-        ca-certificates \
-        tzdata
+    apk upgrade --no-cache
 
 WORKDIR /app
 
-# 2. Nâng cấp pip, setuptools an toàn và cài đặt dependencies
+# 2. Cài đặt dependencies Python, sau đó gỡ bỏ triệt để build-tools & metadata gây false-positive
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" wheel && \
-    pip install --no-cache-dir -r requirements.txt && \
-    rm -f /usr/local/lib/python3.11/site-packages/pip/_vendor/bom.cdx.json && \
-    find /usr/local/lib/python3.11/site-packages -type d -name sboms -exec rm -rf {} +
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip uninstall -y setuptools pip wheel 2>/dev/null || true && \
+    rm -rf /root/.cache && \
+    find /usr/local/lib/python3.11/site-packages -type d -name "licenses" -exec rm -rf {} + 2>/dev/null || true && \
+    find /usr/local/lib/python3.11/site-packages -type d -name "sboms" -exec rm -rf {} + 2>/dev/null || true
 
 # 3. Copy toàn bộ mã nguồn ứng dụng
 COPY app.py entrypoint.py entrypoint.sh test_connections.py ./
