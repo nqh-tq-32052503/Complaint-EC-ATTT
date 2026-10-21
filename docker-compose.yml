@@ -16,7 +16,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8077/docs || exit 1"]
+      test: ["CMD", "/usr/bin/python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8077/health', timeout=5)"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -43,25 +43,6 @@ services:
   # 3. Optional Local Infrastructure Services (Profile: 'infra')
   # Chỉ khởi chạy khi chỉ định `--profile infra` hoặc đặt COMPOSE_PROFILES=infra
   # ============================================================================
-  local-postgres:
-    profiles: ["infra"]
-    image: postgres:16-alpine
-    container_name: complaint-ec-local-postgres
-    restart: unless-stopped
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-shared_projects}
-      POSTGRES_USER: ${POSTGRES_USER:-platform_developer}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Project2026!}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-platform_developer} -d ${POSTGRES_DB:-shared_projects}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   local-rabbitmq:
     profiles: ["infra"]
     image: rabbitmq:3-management
@@ -117,7 +98,6 @@ services:
       retries: 5
 
 volumes:
-  postgres_data:
   rabbitmq_data:
   redis_data:
   minio_data:

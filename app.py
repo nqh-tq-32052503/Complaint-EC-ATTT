@@ -19,8 +19,7 @@ import json
 import asyncio
 import uuid
 import logging
-import psycopg2
-from psycopg2 import pool, sql
+import threading
 
 logger = logging.getLogger(__name__)
 from enum import Enum
@@ -176,141 +175,59 @@ class ExtractResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-# PostgreSQL Configuration (Loaded solely from .env)
-PG_HOST = os.environ.get("POSTGRES_HOST")
-PG_PORT = int(os.environ.get("POSTGRES_PORT", "5432"))
-PG_DBNAME = os.environ.get("POSTGRES_DB", "shared_projects")
-PG_USER = os.environ.get("POSTGRES_USER", "platform_developer")
-PG_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
-PG_SCHEMA = os.environ.get("POSTGRES_SCHEMA", "x2_dannguyen_u1")
-PG_TABLE = os.environ.get("POSTGRES_TABLE", "request_logs")
-
-_pg_pool: Optional[pool.ThreadedConnectionPool] = None
-
-
-def get_pg_pool() -> pool.ThreadedConnectionPool:
-    global _pg_pool
-    if _pg_pool is None:
-        _pg_pool = pool.ThreadedConnectionPool(
-            minconn=1,
-            maxconn=10,
-            host=PG_HOST,
-            port=PG_PORT,
-            dbname=PG_DBNAME,
-            user=PG_USER,
-            password=PG_PASSWORD,
-            connect_timeout=5,
-        )
-    return _pg_pool
-
-
-def init_db():
-    try:
-        p = get_pg_pool()
-        conn = p.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    sql.SQL("CREATE SCHEMA IF NOT EXISTS {};").format(sql.Identifier(PG_SCHEMA))
-                )
-                cur.execute(
-                    sql.SQL("""
-                        CREATE TABLE IF NOT EXISTS {}.{} (
-                            request_id VARCHAR(255) PRIMARY KEY,
-                            status VARCHAR(50) NOT NULL,
-                            result JSONB,
-                            error TEXT,
-                            created_at TIMESTAMPTZ,
-                            updated_at TIMESTAMPTZ
-                        );
-                    """).format(sql.Identifier(PG_SCHEMA), sql.Identifier(PG_TABLE))
-                )
-                conn.commit()
-        finally:
-            p.putconn(conn)
-    except Exception as exc:
-        logger.warning("Không thể khởi tạo schema PostgreSQL (Database có thể đang khởi động hoặc offline): %s", exc)
-
-
-init_db()
+# ---------------------------------------------------------------------------
+# In-Memory Thread-Safe Job Tracking
+# (Không sử dụng cơ sở dữ liệu ngoài để lưu request log, tránh phụ thuộc và license)
+# ---------------------------------------------------------------------------
+_jobs_lock = threading.Lock()
+_jobs: Dict[str, dict] = {}
+_MAX_JOBS = 10000
 
 
 def create_job(request_id: str):
+    """Tạo mới một bản ghi job trong bộ nhớ in-memory."""
     now = datetime.now(timezone.utc)
-    p = get_pg_pool()
-    conn = p.getconn()
-    try:
-        with conn.cursor() as cur:
-            query = sql.SQL("""
-                INSERT INTO {}.{} (request_id, status, created_at, updated_at)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (request_id) DO UPDATE
-                SET status = EXCLUDED.status,
-                    updated_at = EXCLUDED.updated_at
-            """).format(sql.Identifier(PG_SCHEMA), sql.Identifier(PG_TABLE))
-            cur.execute(
-                query,
-                (request_id, JobStatus.PROCESSING.value, now, now),
-            )
-            conn.commit()
-    finally:
-        p.putconn(conn)
+    with _jobs_lock:
+        if len(_jobs) > _MAX_JOBS:
+            # Thu dọn 1000 phần tử cũ nhất nếu vượt giới hạn bộ nhớ
+            old_keys = list(_jobs.keys())[:1000]
+            for k in old_keys:
+                _jobs.pop(k, None)
+        _jobs[request_id] = {
+            "request_id": request_id,
+            "status": JobStatus.PROCESSING,
+            "result": None,
+            "error": None,
+            "created_at": now,
+            "updated_at": now,
+        }
 
 
 def update_job_status(request_id: str, status: JobStatus, result: Optional[dict] = None, error: Optional[str] = None):
+    """Cập nhật trạng thái và kết quả của job trong bộ nhớ in-memory."""
     now = datetime.now(timezone.utc)
-    result_json = json.dumps(result, ensure_ascii=False) if result is not None else None
-    p = get_pg_pool()
-    conn = p.getconn()
-    try:
-        with conn.cursor() as cur:
-            query = sql.SQL("""
-                UPDATE {}.{}
-                SET status = %s, result = %s, error = %s, updated_at = %s
-                WHERE request_id = %s
-            """).format(sql.Identifier(PG_SCHEMA), sql.Identifier(PG_TABLE))
-            cur.execute(
-                query,
-                (status.value, result_json, error, now, request_id),
-            )
-            conn.commit()
-    finally:
-        p.putconn(conn)
+    status_enum = status if isinstance(status, JobStatus) else JobStatus(status)
+    with _jobs_lock:
+        if request_id not in _jobs:
+            _jobs[request_id] = {
+                "request_id": request_id,
+                "created_at": now,
+            }
+        _jobs[request_id].update({
+            "status": status_enum,
+            "result": result,
+            "error": error,
+            "updated_at": now,
+        })
 
 
 def get_job(request_id: str) -> Optional[dict]:
-    p = get_pg_pool()
-    conn = p.getconn()
-    try:
-        with conn.cursor() as cur:
-            query = sql.SQL("""
-                SELECT request_id, status, result, error
-                FROM {}.{}
-                WHERE request_id = %s
-            """).format(sql.Identifier(PG_SCHEMA), sql.Identifier(PG_TABLE))
-            cur.execute(
-                query,
-                (request_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-            req_id, status_str, result_val, error_str = row
-            if isinstance(result_val, str):
-                result_dict = json.loads(result_val)
-            elif isinstance(result_val, dict):
-                result_dict = result_val
-            else:
-                result_dict = None
-
-            return {
-                "request_id": req_id,
-                "status": JobStatus(status_str),
-                "result": result_dict,
-                "error": error_str,
-            }
-    finally:
-        p.putconn(conn)
+    """Lấy thông tin job từ bộ nhớ in-memory theo request_id."""
+    with _jobs_lock:
+        job = _jobs.get(request_id)
+        if not job:
+            return None
+        return dict(job)
 
 
 # ---------------------------------------------------------------------------

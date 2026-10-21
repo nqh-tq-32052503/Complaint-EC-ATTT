@@ -1,7 +1,6 @@
 import os
 import json
 import re
-import fitz
 import time
 import hashlib
 import asyncio
