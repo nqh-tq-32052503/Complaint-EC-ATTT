@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/kien-nghi.schema.json",
+  "title": "KienNghiTongHop",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["metadata", "kien_nghi", "tong_so_kien_nghi", "cac_don_vi_nhan"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["success", "failed"],
+      "description": "Trạng thái xử lý trích xuất"
+    },
+    "error": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": ["TABLE_CONTENT_UNSUPPORTED"]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ky_hop",
+        "quoc_hoi_khoa",
+        "hinh_thuc",
+        "document_number",
+        "issue_date",
+        "signer",
+        "ten_doan_db"
+      ],
+      "properties": {
+        "ky_hop": {
+          "type": ["string", "null"],
+          "description": "Ví dụ: Kỳ họp thứ 9"
+        },
+        "quoc_hoi_khoa": {
+          "type": ["string", "null"],
+          "description": "Ví dụ: XV"
+        },
+        "hinh_thuc": {
+          "type": ["string", "null"],
+          "description": "Trước kỳ họp hoặc Sau kỳ họp"
+        },
+        "document_number": {
+          "type": ["string", "null"],
+          "description": "Số công văn"
+        },
+        "issue_date": {
+          "type": ["string", "null"],
+          "description": "Ngày ban hành"
+        },
+        "signer": {
+          "type": ["string", "null"],
+          "description": "Người ký"
+        },
+        "ten_doan_db": {
+          "type": ["string", "null"],
+          "description": "Tên Đoàn đại biểu Quốc hội"
+        }
+      }
+    },
+    "kien_nghi": {
+      "type": "array",
+      "description": "Danh sách kiến nghị",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "stt",
+          "don_vi_nhan",
+          "so_thu_tu_kien_nghi",
+          "noi_dung",
+          "headers"
+        ],
+        "properties": {
+          "stt": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "STT toàn bộ kiến nghị"
+          },
+          "don_vi_nhan": {
+            "type": "array",
+            "description": "Top 5 cơ quan thẩm quyền dự đoán, sắp xếp theo mức độ phù hợp giảm dần",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "ten_don_vi",
+                "muc_do_tin_cay",
+                "phuong_phap",
+                "is_mapped"
+              ],
+              "properties": {
+                "ten_don_vi": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Tên cơ quan thẩm quyền"
+                },
+                "muc_do_tin_cay": {
+                  "type": "string",
+                  "enum": ["high", "medium", "low"],
+                  "description": "Mức độ tin cậy của kết quả: cao (high), trung bình (medium), thấp (low)"
+                },
+                "phuong_phap": {
+                  "type": "string",
+                  "minLength": 1,
+                  "examples": ["rule_based", "llm", "hybrid"],
+                  "description": "Mã phương pháp tạo ra kết quả, ví dụ: rule_based, llm, hybrid hoặc một phương pháp khác"
+                },
+                "is_mapped": {
+                  "type": ["boolean", "null"],
+                  "description": "Trạng thái mapping đơn vị ứng viên với danh sách cơ quan thẩm quyền lấy từ database"
+                }
+              }
+            }
+          },
+          "so_thu_tu_kien_nghi": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "STT trong cơ quan thẩm quyền được chọn làm kết quả chính (phần tử đầu tiên của don_vi_nhan)"
+          },
+          "noi_dung": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Nội dung kiến nghị"
+          },
+          "headers": {
+            "type": "array",
+            "description": "Các cấp tiêu đề chứa kiến nghị này",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "tong_so_kien_nghi": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Tổng số kiến nghị"
+    },
+    "cac_don_vi_nhan": {
+      "type": "array",
+      "description": "Danh sách cơ quan thẩm quyền duy nhất xuất hiện trong các kết quả dự đoán",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

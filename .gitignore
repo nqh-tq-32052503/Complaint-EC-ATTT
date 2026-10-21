@@ -1,0 +1,13 @@
+logs/* 
+eval_*
+**/__pycache__
+responses_v4_backup/
+*.log
+cache/
+**/.ipynb_checkpoints
+jobs.db
+2026-*/
+*.pid
+.env
+.env.*
+!.env.example
