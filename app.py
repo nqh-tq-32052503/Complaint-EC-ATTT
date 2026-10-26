@@ -15,15 +15,17 @@ Chạy thử:
 from __future__ import annotations
 
 import os
+import io
 import json
 import asyncio
 import uuid
 import logging
 import threading
-
-logger = logging.getLogger(__name__)
+import secrets
 from enum import Enum
 
+import filetype
+import pypdf
 from config.env_loader import load_project_env
 load_project_env()
 from datetime import datetime, timezone, timedelta
@@ -31,7 +33,22 @@ from typing import List, Literal, Optional, Dict, Tuple, Any, Annotated
 from dataclasses import dataclass, field
 import time
 
-from fastapi import Request, FastAPI, File, Form, HTTPException, UploadFile, Response, BackgroundTasks
+from fastapi import (
+    Request,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    Response,
+    BackgroundTasks,
+    Security,
+    Depends,
+    status,
+)
+from fastapi.security import APIKeyHeader
+
+logger = logging.getLogger(__name__)
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from modules.pipeline import Pipeline, file_hash
 from modules.pdf_extractor import TableContentUnsupportedError
@@ -184,7 +201,7 @@ _jobs: Dict[str, dict] = {}
 _MAX_JOBS = 10000
 
 
-def create_job(request_id: str):
+def create_job(request_id: str, owner_id: Optional[str] = None):
     """Tạo mới một bản ghi job trong bộ nhớ in-memory."""
     now = datetime.now(timezone.utc)
     with _jobs_lock:
@@ -200,6 +217,7 @@ def create_job(request_id: str):
             "error": None,
             "created_at": now,
             "updated_at": now,
+            "owner_id": owner_id,
         }
 
 
@@ -403,7 +421,90 @@ async def process_pdf_follower(
 # ---------------------------------------------------------------------------
 
 ALLOWED_CONTENT_TYPES = {"application/pdf"}
-MAX_PDF_SIZE_BYTES = 30 * 1024 * 1024  # 20MB, tuỳ chỉnh theo nhu cầu
+MAX_PDF_SIZE_BYTES = 30 * 1024 * 1024  # 30MB, tuỳ chỉnh theo nhu cầu
+
+
+# ---------------------------------------------------------------------------
+# Xác thực API Key (BUG-1113) & Kiểm tra File PDF đầu vào (BUG-1123)
+# ---------------------------------------------------------------------------
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def verify_api_key(
+    request: Request,
+    api_key_header_val: Optional[str] = Security(API_KEY_HEADER),
+) -> str:
+    """
+    Xác thực API Key truy cập hệ thống:
+    - Tiếp nhận token từ Header 'X-API-Key' hoặc 'Authorization: Bearer <token>'
+    - Khắc phục lỗ hổng BUG-1113 (Thiếu xác thực API)
+    """
+    token = api_key_header_val
+    if not token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+
+    expected_raw = os.environ.get("SERVICE_API_KEY") or os.environ.get("API_KEY")
+    if not expected_raw:
+        logger.error("Hệ thống chưa được cấu hình biến môi trường SERVICE_API_KEY")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Máy chủ chưa được cấu hình khóa bảo mật API (SERVICE_API_KEY)",
+        )
+
+    valid_keys = [k.strip() for k in expected_raw.split(",") if k.strip()]
+    if not token or not any(secrets.compare_digest(token, vk) for vk in valid_keys):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Không có quyền truy cập: API Key không hợp lệ hoặc bị thiếu (Vui lòng gửi qua header X-API-Key)",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    return token
+
+
+def validate_pdf_content(file_bytes: bytes) -> Tuple[bool, str]:
+    """
+    Xác thực nội dung file PDF kết hợp cả 3 phương án bảo vệ đa tầng (BUG-1123):
+    - Tầng 1: Kiểm tra kích thước tối thiểu, Magic Bytes (%PDF-) ở đầu và EOF marker (%%EOF) ở cuối (Pure Python, 0% rủi ro License).
+    - Tầng 2: Kiểm tra cấu trúc file signature MIME type bằng thư viện filetype (MIT License, 0 CVE).
+    - Tầng 3: Kiểm tra tính hợp lệ cấu trúc PDF bằng thư viện pypdf >= 4.3.0 (BSD License, chỉ check pages, chống DoS/corrupt).
+    """
+    # 1. Kích thước tối thiểu
+    if not file_bytes or len(file_bytes) < 32:
+        return False, "File rỗng hoặc kích thước quá nhỏ (< 32 bytes)"
+
+    # 2. Tầng 1 (Pure Python): Magic Bytes và EOF marker
+    header_chunk = file_bytes[:1024].lstrip()
+    if not header_chunk.startswith(b"%PDF-"):
+        return False, "Không tìm thấy chữ ký header hợp lệ của file PDF (%PDF-)"
+
+    tail_chunk = file_bytes[-1024:].rstrip()
+    if b"%%EOF" not in tail_chunk:
+        return False, "File PDF không hoàn chỉnh hoặc bị cắt xén (thiếu marker %%EOF)"
+
+    # 3. Tầng 2 (filetype - MIT License, 0 CVE): Nhận diện binary signature
+    try:
+        kind = filetype.guess(file_bytes)
+        recognized = kind.mime if kind else "Unknown"
+        if kind is None or kind.mime != "application/pdf":
+            return False, f"Chữ ký nhị phân không khớp định dạng PDF (nhận diện: {recognized})"
+    except Exception as exc:
+        logger.warning(f"Lỗi kiểm tra filetype: {exc}")
+        return False, f"Lỗi phân tích chữ ký tệp tin: {exc}"
+
+    # 4. Tầng 3 (pypdf - BSD 3-Clause): Xác thực cấu trúc tối thiểu (không parse text stream để chống DoS)
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(file_bytes), strict=False)
+        if len(reader.pages) == 0:
+            return False, "Tài liệu PDF không có trang nào"
+    except Exception as exc:
+        logger.warning(f"Lỗi kiểm tra cấu trúc pypdf: {exc}")
+        return False, f"Cấu trúc tệp PDF bị lỗi hoặc không thể đọc: {exc}"
+
+    return True, "Valid"
+
 
 class OCRError(Exception):
     """Lỗi phát sinh trong bước OCR trung gian."""
@@ -781,7 +882,7 @@ def _process_cached_result(cached_result: dict, cache_key: str) -> None:
     sync_write_json_to_minio_bucket(cache_key, cached_result, bucket_name=MINIO_CACHE_BUCKET)
 
 
-def _handle_cached_pdf(cache_key: str, pdf_hash: str) -> Optional[ExtractResponse]:
+def _handle_cached_pdf(cache_key: str, pdf_hash: str, owner_id: Optional[str] = None) -> Optional[ExtractResponse]:
     cached_result = sync_get_json_from_minio(cache_key, bucket_name=MINIO_CACHE_BUCKET)
     if cached_result is None:
         return None
@@ -790,7 +891,7 @@ def _handle_cached_pdf(cache_key: str, pdf_hash: str) -> Optional[ExtractRespons
 
     print(f"[INFO] Cache hit in MinIO bucket '{MINIO_CACHE_BUCKET}' for hash: {pdf_hash}")
     request_id = str(uuid.uuid4())
-    create_job(request_id)
+    create_job(request_id, owner_id=owner_id)
     update_job_status(request_id, JobStatus.FINISHED, result=cached_result)
     return ExtractResponse(
         request_id=request_id,
@@ -832,14 +933,16 @@ def _dispatch_single_flight(
     "/extract",
     response_model_exclude_unset=True,
     responses={
+        401: {"description": "Unauthorized - Thiếu hoặc sai API Key"},
         413: {"description": "Payload Too Large - File vượt quá kích thước cho phép"},
-        415: {"description": "Unsupported Media Type - Chỉ chấp nhận file PDF"},
+        415: {"description": "Unsupported Media Type - Định dạng file không hợp lệ"},
     },
 )
 async def extract(
     background_tasks: BackgroundTasks,
     file: Annotated[UploadFile, File(description="File PDF công văn cần trích xuất")],
     force_reprocess: Annotated[bool, Form(description="Tùy chọn ép buộc xử lý lại không dùng cache")] = False,
+    api_key: str = Depends(verify_api_key),
 ) -> ExtractResponse:
     """
     Endpoint POST /extract tiếp nhận file PDF và khởi tạo tác vụ trích xuất bất đồng bộ (Polling Pattern):
@@ -847,6 +950,7 @@ async def extract(
       + False (mặc định): Kiểm tra trong MinIO bucket 'cache'. Nếu đã có kết quả mã hash, trả về ngay kết quả JSON.
       + True: Không kiểm tra trong MinIO bucket 'cache', xử lý bình thường qua pipeline, sau đó hash và update/ghi đè kết quả vào MinIO bucket 'cache'.
     """
+    filename = os.path.basename(file.filename or "uploaded.pdf")
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
             status_code=415,
@@ -861,13 +965,20 @@ async def extract(
             detail=f"File vượt quá kích thước cho phép ({MAX_PDF_SIZE_BYTES // (1024 * 1024)}MB)",
         )
 
-    filename = file.filename or "uploaded.pdf"
+    # BUG-1123: Kiểm tra đa tầng nội dung file PDF (Magic Bytes + filetype + pypdf)
+    is_valid, err_msg = validate_pdf_content(pdf_bytes)
+    if not is_valid:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Chỉ chấp nhận file PDF hợp lệ: {err_msg}",
+        )
+
     pdf_hash = file_hash(pdf_bytes)
     cache_key = f"{pdf_hash}.json"
 
     # Nếu force_reprocess = False, check cache trong MinIO cache bucket
     if not force_reprocess:
-        cached_resp = _handle_cached_pdf(cache_key, pdf_hash)
+        cached_resp = _handle_cached_pdf(cache_key, pdf_hash, owner_id=api_key)
         if cached_resp is not None:
             return cached_resp
 
@@ -882,8 +993,8 @@ async def extract(
     else:
         print(f"[Request {request_id}] Đã nhận file '{filename}' (hash: {pdf_hash}). CẢNH BÁO: Celery/Queue không hoạt động ({celery_reason}) -> Tự động Fallback sang Python in-process (không đẩy vào queue).")
 
-    # Tạo bản ghi trong DB với trạng thái PROCESSING cho request hiện tại
-    create_job(request_id)
+    # Tạo bản ghi trong DB với trạng thái PROCESSING cho request hiện tại, gắn với API key người tạo job (BUG-1113)
+    create_job(request_id, owner_id=api_key)
 
     # Đăng ký vai trò Leader hoặc Follower trong nhóm SingleFlight
     role, flight = await single_flight_mgr.acquire_or_join(pdf_hash, force_reprocess, request_id)
@@ -901,9 +1012,16 @@ async def extract(
 @app.get(
     "/extract/{request_id}",
     response_model_exclude_unset=True,
-    responses={404: {"description": "Request ID not found"}},
+    responses={
+        401: {"description": "Unauthorized - Thiếu hoặc sai API Key"},
+        403: {"description": "Forbidden - Không có quyền truy cập job của client khác"},
+        404: {"description": "Request ID not found"},
+    },
 )
-def get_extract_status(request_id: str) -> ExtractResponse:
+def get_extract_status(
+    request_id: str,
+    api_key: str = Depends(verify_api_key),
+) -> ExtractResponse:
     """
     Client định kỳ gọi endpoint này để kiểm tra trạng thái xử lý (Polling).
     - PROCESSING: Trả về status PROCESSING
@@ -914,6 +1032,13 @@ def get_extract_status(request_id: str) -> ExtractResponse:
     job = get_job(request_id)
     if not job:
         raise HTTPException(status_code=404, detail="request_id not found")
+
+    job_owner = job.get("owner_id")
+    if job_owner and not secrets.compare_digest(job_owner, api_key):
+        raise HTTPException(
+            status_code=403,
+            detail="Không có quyền truy cập: Bạn không phải người khởi tạo tác vụ này",
+        )
 
     return ExtractResponse(
         request_id=job["request_id"],
@@ -928,8 +1053,14 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.get("/health/celery")
-def celery_health_check(force_check: bool = False) -> dict:
+@app.get(
+    "/health/celery",
+    responses={401: {"description": "Unauthorized - Thiếu hoặc sai API Key"}},
+)
+def celery_health_check(
+    force_check: bool = False,
+    api_key: str = Depends(verify_api_key),
+) -> dict:
     """Kiểm tra trực tiếp trạng thái sẵn sàng của Broker, Result Backend và các Celery Workers."""
     from modules.celery_health import check_celery_and_queue_health
     is_ok, msg = check_celery_and_queue_health(force_check=force_check)

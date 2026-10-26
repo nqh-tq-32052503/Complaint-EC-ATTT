@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 # MinIO Configuration loaded solely from .env
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT")
-MINIO_ACCESS_KEY = os.environ.get("MINIO_ROOT_USER", "platform_developer")
+MINIO_ACCESS_KEY = os.environ.get("MINIO_ROOT_USER", "")
 MINIO_SECRET_KEY = os.environ.get("MINIO_ROOT_PASSWORD", "")
 MINIO_BUCKET_NAME = os.environ.get("MINIO_BUCKET_NAME", "x2-dannguyen-uc1-logs")
 MINIO_CACHE_BUCKET = os.environ.get("MINIO_CACHE_BUCKET", "x2-dannguyen-uc1-cache")
@@ -54,7 +54,7 @@ def ensure_bucket_exists(client: Minio, bucket_name: str):
         # Nếu đã tồn tại hoặc không có quyền tạo bucket thì ghi log debug
         logger.debug("Bucket '%s' check/creation bypassed: %s", bucket_name, exc)
 
-    # Trên cụm shared MinIO, tài khoản platform_developer không có quyền set_bucket_policy (chỉ admin có quyền)
+    # Trên cụm shared MinIO, tài khoản client/user thông thường không có quyền set_bucket_policy (chỉ admin có quyền)
     # Thử thiết lập policy một lần, nếu bị AccessDenied thì bỏ qua không in warning
     try:
         policy = {

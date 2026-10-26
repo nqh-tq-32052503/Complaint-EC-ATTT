@@ -52,8 +52,8 @@ services:
       - "5674:5672"
       - "15674:15672"
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-platform_developer}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-Project2026!}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
@@ -86,8 +86,8 @@ services:
       - "9012:9000"
       - "9013:9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-platform_developer}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-Project2026!}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
       - minio_data:/data
     command: server /data --console-address ":9001"

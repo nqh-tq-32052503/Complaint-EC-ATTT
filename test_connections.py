@@ -56,7 +56,7 @@ def test_redis() -> bool:
 
 def test_minio() -> bool:
     endpoint = os.environ.get("MINIO_ENDPOINT", "")
-    access_key = os.environ.get("MINIO_ROOT_USER", "platform_developer")
+    access_key = os.environ.get("MINIO_ROOT_USER", "")
     secret_key = os.environ.get("MINIO_ROOT_PASSWORD", "")
     secure = os.environ.get("MINIO_SECURE", "false").lower() == "true"
 

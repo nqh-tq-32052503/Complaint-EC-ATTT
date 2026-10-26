@@ -1,4 +1,5 @@
 import io
+import os
 import pytest
 from unittest.mock import patch
 from tests.assertions import check_equal, check_in, check_true
@@ -125,3 +126,98 @@ class TestSecurityValidation:
         # 3. Endpoint /extract/{request_id}/result (GET)
         res_get_result = client.get("/extract/c7a812ef-29b1-4b16-9ef0-0a568b209d84/result")
         check_in(res_get_result.status_code, (404, 405), f"Endpoint /extract/.../result vẫn đang mở! HTTP {res_get_result.status_code}")
+
+    # -------------------------------------------------------------------------
+    # BUG-1123: Kiểm tra nội dung file tải lên (Magic Bytes & Structural Validation)
+    # -------------------------------------------------------------------------
+    def test_bug_1123_not_a_pdf_poc_rejected(self, client):
+        """
+        Tái hiện chính xác PoC của Pentest cho BUG-1123:
+        - filename: 'not-a-pdf.pdf'
+        - Content-Type: 'application/pdf'
+        - Body: 'NOTPDF'
+        Hệ thống bắt buộc phải từ chối với HTTP 415.
+        """
+        files = {"file": ("not-a-pdf.pdf", b"NOTPDF", "application/pdf")}
+        response = client.post("/extract", files=files)
+        check_equal(response.status_code, 415)
+        data = response.json()
+        check_in("Chỉ chấp nhận file PDF hợp lệ", data["detail"])
+
+    def test_bug_1123_truncated_pdf_missing_eof_rejected(self, client):
+        """Kiểm tra tệp tin có header %PDF- nhưng bị cắt xén thiếu marker %%EOF."""
+        truncated_pdf = b"%PDF-1.4\n" + b"Random fake binary payload" * 10
+        files = {"file": ("corrupted.pdf", truncated_pdf, "application/pdf")}
+        response = client.post("/extract", files=files)
+        check_equal(response.status_code, 415)
+        data = response.json()
+        check_in("marker %%EOF", data["detail"])
+
+    def test_bug_1123_non_pdf_file_signature_rejected(self, client):
+        """Kiểm tra tệp giả mạo có chữ ký PNG nhưng đặt đuôi .pdf và MIME application/pdf."""
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+        files = {"file": ("fake_image.pdf", png_bytes, "application/pdf")}
+        response = client.post("/extract", files=files)
+        check_equal(response.status_code, 415)
+
+    # -------------------------------------------------------------------------
+    # BUG-1113: Kiểm tra xác thực quyền sử dụng API bằng API Key & Ownership
+    # -------------------------------------------------------------------------
+    def test_bug_1113_unauthenticated_request_rejected(self, unauthenticated_client):
+        """Các endpoint nghiệp vụ bắt buộc phải có API Key, từ chối khi không truyền key (HTTP 401)."""
+        # 1. POST /extract
+        res_post = unauthenticated_client.post("/extract")
+        check_equal(res_post.status_code, 401)
+        check_in("API Key không hợp lệ hoặc bị thiếu", res_post.json()["detail"])
+
+        # 2. GET /extract/{request_id}
+        res_get = unauthenticated_client.get("/extract/some-uuid-1234")
+        check_equal(res_get.status_code, 401)
+
+        # 3. GET /health/celery
+        res_celery = unauthenticated_client.get("/health/celery")
+        check_equal(res_celery.status_code, 401)
+
+        # 4. GET /health (Liveness probe không cần auth)
+        res_health = unauthenticated_client.get("/health")
+        check_equal(res_health.status_code, 200)
+
+    def test_bug_1113_invalid_api_key_rejected(self, unauthenticated_client):
+        """Kiểm tra từ chối khi API Key sai (HTTP 401)."""
+        bad_headers = {"X-API-Key": "completely_wrong_key_xyz"}
+        res = unauthenticated_client.post("/extract", headers=bad_headers)
+        check_equal(res.status_code, 401)
+
+    def test_bug_1113_bearer_token_authentication(self, unauthenticated_client, sample_valid_pdf_bytes):
+        """Kiểm tra hỗ trợ xác thực bằng header Authorization: Bearer <token>."""
+        valid_key = os.environ.get("SERVICE_API_KEY", "test-secret-api-key-8077")
+        bearer_headers = {"Authorization": f"Bearer {valid_key}"}
+        files = {"file": ("valid.pdf", sample_valid_pdf_bytes, "application/pdf")}
+
+        with patch("modules.celery_health.check_celery_and_queue_health", return_value=(True, "OK")):
+            res = unauthenticated_client.post("/extract", files=files, headers=bearer_headers)
+        check_equal(res.status_code, 200)
+
+    def test_bug_1113_job_ownership_isolation(self, unauthenticated_client, sample_valid_pdf_bytes, monkeypatch):
+        """Kiểm tra cơ chế gắn job với người tạo (chống đọc trộm kết quả của client khác - HTTP 403)."""
+        valid_key_a = "key-client-a-1113"
+        valid_key_b = "key-client-b-1113"
+
+        # Cấu hình 2 API key hợp lệ đồng thời (hỗ trợ phân tách client & rotation)
+        monkeypatch.setenv("SERVICE_API_KEY", f"{valid_key_a},{valid_key_b}")
+
+        # Client A tạo job
+        files = {"file": ("doc_a.pdf", sample_valid_pdf_bytes, "application/pdf")}
+        with patch("modules.celery_health.check_celery_and_queue_health", return_value=(True, "OK")):
+            res_a = unauthenticated_client.post("/extract", files=files, headers={"X-API-Key": valid_key_a})
+        check_equal(res_a.status_code, 200)
+        req_id = res_a.json()["request_id"]
+
+        # Client A kiểm tra job của mình -> Thành công (200)
+        res_get_a = unauthenticated_client.get(f"/extract/{req_id}", headers={"X-API-Key": valid_key_a})
+        check_equal(res_get_a.status_code, 200)
+
+        # Client B cố tình đọc job của Client A -> Bị từ chối (403 Forbidden)
+        res_get_b = unauthenticated_client.get(f"/extract/{req_id}", headers={"X-API-Key": valid_key_b})
+        check_equal(res_get_b.status_code, 403)
+        check_in("Không có quyền truy cập", res_get_b.json()["detail"])

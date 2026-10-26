@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 # Thiết lập biến môi trường phục vụ môi trường test
 os.environ["TESTING"] = "true"
+os.environ["SERVICE_API_KEY"] = "test-secret-api-key-8077"
 os.environ["MINIO_ENDPOINT"] = "127.0.0.1:9000"
 os.environ["POSTGRES_HOST"] = "127.0.0.1"
 os.environ["POSTGRES_PORT"] = "5432"
@@ -28,12 +29,13 @@ def isolated_job_store(monkeypatch):
     in_memory_db = {}
     in_memory_minio = {}
 
-    def mock_create_job(request_id: str):
+    def mock_create_job(request_id: str, owner_id: str = None):
         in_memory_db[request_id] = {
             "request_id": request_id,
             "status": app.JobStatus.PROCESSING,
             "result": None,
             "error": None,
+            "owner_id": owner_id,
         }
 
     def mock_get_job(request_id: str):
@@ -67,7 +69,15 @@ def isolated_job_store(monkeypatch):
 
 @pytest.fixture
 def client():
-    """Khởi tạo TestClient của FastAPI."""
+    """Khởi tạo TestClient của FastAPI với header xác thực API Key mặc định."""
+    api_key = os.environ.get("SERVICE_API_KEY", "test-secret-api-key-8077")
+    with TestClient(app.app, headers={"X-API-Key": api_key}) as c:
+        yield c
+
+
+@pytest.fixture
+def unauthenticated_client():
+    """Khởi tạo TestClient không có header xác thực phục vụ kiểm thử bảo mật."""
     with TestClient(app.app) as c:
         yield c
 
