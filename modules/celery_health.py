@@ -1,6 +1,9 @@
 import os
 import time
+import logging
 from typing import Tuple, List, Optional, Any
+
+logger = logging.getLogger(__name__)
 
 _last_health_check_time: float = 0.0
 _last_health_status: Tuple[bool, str] = (True, "Initialized")
@@ -14,7 +17,8 @@ def _check_broker(celery_app: Any, timeout: float) -> Tuple[bool, Optional[str]]
             conn.ensure_connection(max_retries=1, timeout=timeout)
         return True, None
     except Exception as exc:
-        return False, f"Celery Broker (RabbitMQ) không phản hồi hoặc mất kết nối: {exc}"
+        logger.error(f"Celery Broker (RabbitMQ) không phản hồi hoặc mất kết nối: {exc}", exc_info=True)
+        return False, "Celery Broker (RabbitMQ) không phản hồi hoặc mất kết nối"
 
 
 def _check_backend(celery_app: Any) -> Tuple[bool, Optional[str]]:
@@ -25,7 +29,8 @@ def _check_backend(celery_app: Any) -> Tuple[bool, Optional[str]]:
             return False, "Celery Result Backend (Redis) trả về phản hồi không hợp lệ"
         return True, None
     except Exception as exc:
-        return False, f"Celery Result Backend (Redis) không phản hồi hoặc mất kết nối: {exc}"
+        logger.error(f"Celery Result Backend (Redis) không phản hồi hoặc mất kết nối: {exc}", exc_info=True)
+        return False, "Celery Result Backend (Redis) không phản hồi hoặc mất kết nối"
 
 
 def _filter_active_pipeline_workers(pings: List[Any]) -> List[str]:
@@ -53,7 +58,8 @@ def _check_workers(celery_app: Any, timeout: float) -> Tuple[bool, Optional[str]
 
         return True, None, len(active_workers)
     except Exception as exc:
-        return False, f"Lỗi khi kiểm tra trạng thái Celery workers: {exc}", 0
+        logger.error(f"Lỗi khi kiểm tra trạng thái Celery workers: {exc}", exc_info=True)
+        return False, "Lỗi khi kiểm tra trạng thái Celery workers", 0
 
 
 def check_celery_and_queue_health(
@@ -73,7 +79,8 @@ def check_celery_and_queue_health(
     try:
         from tasks.celery_app import celery_app
     except Exception as exc:
-        _last_health_status = (False, f"Không thể nạp Celery application: {exc}")
+        logger.error(f"Không thể nạp Celery application: {exc}", exc_info=True)
+        _last_health_status = (False, "Không thể nạp Celery application")
         _last_health_check_time = now
         return _last_health_status
 

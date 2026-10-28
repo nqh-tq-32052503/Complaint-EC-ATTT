@@ -4,7 +4,7 @@ import uuid
 import pytest
 from unittest.mock import patch
 
-from app import JobStatus, KienNghiTongHop
+from app import JobStatus, KienNghiTongHop, GENERIC_ERROR_MESSAGE
 from modules.pipeline import file_hash
 from tests.assertions import (
     check_equal,
@@ -135,7 +135,8 @@ class TestApiEndpoints:
         check_equal(data["request_id"], req_id)
         check_equal(data["status"], "FAILED")
         check_is_none(data["result"])
-        check_equal(data["error"], err_msg)
+        # BUG-1120: Không trả về chi tiết lỗi mà chỉ trả về thông báo chung
+        check_equal(data["error"], GENERIC_ERROR_MESSAGE)
 
     def test_get_extract_status_not_found(self, client):
         """Kiểm tra Endpoint Polling (GET /extract/{request_id}) với mã request_id không tồn tại."""

@@ -221,3 +221,72 @@ class TestSecurityValidation:
         res_get_b = unauthenticated_client.get(f"/extract/{req_id}", headers={"X-API-Key": valid_key_b})
         check_equal(res_get_b.status_code, 403)
         check_in("Không có quyền truy cập", res_get_b.json()["detail"])
+
+    # -------------------------------------------------------------------------
+    # BUG-1120: Phản hồi lỗi không lộ chuỗi exception
+    # -------------------------------------------------------------------------
+    def test_bug_1120_get_extract_status_masks_exception(self, client, isolated_job_store):
+        """
+        Kiểm tra BUG-1120: Endpoint GET /extract/{request_id} tuyệt đối không lộ chuỗi exception:
+        - Bất kể lỗi nội bộ nào (DB connection, timeout, null pointer, OCR driver exception,...),
+        - Trường error chỉ trả về thông báo chung chung.
+        """
+        import uuid
+        from app import JobStatus, GENERIC_ERROR_MESSAGE
+
+        req_id = str(uuid.uuid4())
+        sensitive_exception = "psycopg2.OperationalError: FATAL: password authentication failed for user 'postgres'"
+        isolated_job_store["db"][req_id] = {
+            "request_id": req_id,
+            "status": JobStatus.FAILED,
+            "result": None,
+            "error": sensitive_exception,
+        }
+
+        response = client.get(f"/extract/{req_id}")
+        check_equal(response.status_code, 200)
+        data = response.json()
+        check_equal(data["status"], "FAILED")
+        check_equal(data["error"], GENERIC_ERROR_MESSAGE)
+        # Khẳng định không chứa chuỗi nhạy cảm nào
+        assert sensitive_exception not in response.text
+        assert "psycopg2" not in response.text
+        assert "password" not in response.text
+
+    def test_bug_1120_update_job_status_masks_error_string(self):
+        """Kiểm tra hàm update_job_status tự động chuẩn hóa mọi error thành thông báo chung."""
+        import uuid
+        from app import update_job_status, get_job, JobStatus, GENERIC_ERROR_MESSAGE
+
+        req_id = str(uuid.uuid4())
+        sensitive_trace = "Traceback (most recent call last): ZeroDivisionError: division by zero"
+        update_job_status(req_id, JobStatus.FAILED, error=sensitive_trace)
+
+        job = get_job(req_id)
+        check_equal(job["status"], JobStatus.FAILED)
+        check_equal(job["error"], GENERIC_ERROR_MESSAGE)
+        assert sensitive_trace not in (job["error"] or "")
+
+    def test_bug_1120_celery_health_check_masks_driver_exception(self, client):
+        """Kiểm tra GET /health/celery không làm lộ chuỗi exception của RabbitMQ / Redis."""
+        with patch("modules.celery_health._check_broker", return_value=(False, "Celery Broker (RabbitMQ) không phản hồi hoặc mất kết nối")):
+            res = client.get("/health/celery")
+            check_equal(res.status_code, 200)
+            data = res.json()
+            check_equal(data["celery_active"], False)
+            assert "amqp" not in data["detail"].lower()
+            assert "exception" not in data["detail"].lower()
+
+    def test_bug_1120_unhandled_server_exception_returns_generic_message(self):
+        """Kiểm tra ngoại lệ bất ngờ (500) được bắt và trả về thông báo chung, không lộ stack trace."""
+        from app import app, GENERIC_ERROR_MESSAGE
+        from fastapi.testclient import TestClient
+
+        with patch("app.get_job", side_effect=RuntimeError("Internal database connection broke: password=secret")):
+            safe_client = TestClient(app, raise_server_exceptions=False)
+            res = safe_client.get("/extract/any-id", headers={"X-API-Key": "test-secret-api-key-8077"})
+            check_equal(res.status_code, 500)
+            data = res.json()
+            check_equal(data["detail"], GENERIC_ERROR_MESSAGE)
+            assert "password" not in res.text
+            assert "RuntimeError" not in res.text

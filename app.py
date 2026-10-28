@@ -46,6 +46,7 @@ from fastapi import (
     Depends,
     status,
 )
+from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 
 logger = logging.getLogger(__name__)
@@ -183,6 +184,10 @@ class JobStatus(str, Enum):
     FAILED = "FAILED"
 
 
+# BUG-1120: Thông báo lỗi chung chung (Generic Error Message) tránh lộ chi tiết chuỗi exception
+GENERIC_ERROR_MESSAGE = "Đã xảy ra lỗi trong quá trình xử lý yêu cầu."
+
+
 class ExtractResponse(BaseModel):
     request_id: str
     status: JobStatus
@@ -225,6 +230,8 @@ def update_job_status(request_id: str, status: JobStatus, result: Optional[dict]
     """Cập nhật trạng thái và kết quả của job trong bộ nhớ in-memory."""
     now = datetime.now(timezone.utc)
     status_enum = status if isinstance(status, JobStatus) else JobStatus(status)
+    # BUG-1120: Chuẩn hóa field error thành thông báo chung nếu có lỗi
+    sanitized_error = GENERIC_ERROR_MESSAGE if (error is not None or status_enum == JobStatus.FAILED) else None
     with _jobs_lock:
         if request_id not in _jobs:
             _jobs[request_id] = {
@@ -234,7 +241,7 @@ def update_job_status(request_id: str, status: JobStatus, result: Optional[dict]
         _jobs[request_id].update({
             "status": status_enum,
             "result": result,
-            "error": error,
+            "error": sanitized_error,
             "updated_at": now,
         })
 
@@ -370,8 +377,8 @@ async def process_pdf_leader(
 
         update_job_status(request_id, JobStatus.FINISHED, result=result_dict)
     except TableContentUnsupportedError as exc:
-        print(f"[Table Detected] PDF contains table for request {request_id} (hash: {pdf_hash}): {exc}")
-        result_response = create_table_error_response(message=str(exc))
+        logger.warning(f"[Table Detected] PDF contains table for request {request_id} (hash: {pdf_hash}): {exc}")
+        result_response = create_table_error_response(message="File PDF chứa bảng biểu (table), hiện tại hệ thống chưa hỗ trợ trích xuất dữ liệu từ bảng.")
         result_dict = result_response.model_dump()
 
         # Lưu cache kết quả lỗi vào MinIO bucket cache
@@ -379,8 +386,9 @@ async def process_pdf_leader(
 
         update_job_status(request_id, JobStatus.FINISHED, result=result_dict)
     except Exception as exc:
-        print(f"[Leader Error] Processing failed for request {request_id} (hash: {pdf_hash}): {exc}")
-        error_str = f"Lỗi xử lý: {str(exc)}"
+        # BUG-1120: Ghi chi tiết exception vào server log, không lưu chuỗi exception cụ thể vào lỗi job
+        logger.error(f"[Leader Error] Processing failed for request {request_id} (hash: {pdf_hash}): {exc}", exc_info=True)
+        error_str = GENERIC_ERROR_MESSAGE
         update_job_status(request_id, JobStatus.FAILED, error=error_str)
     finally:
         # Báo cho SingleFlightManager giải phóng và đánh thức tất cả Follower
@@ -405,15 +413,16 @@ async def process_pdf_follower(
         async with asyncio.timeout(FOLLOWER_TIMEOUT_SECONDS):
             await flight.event.wait()
         if flight.error:
-            update_job_status(request_id, JobStatus.FAILED, error=flight.error)
+            update_job_status(request_id, JobStatus.FAILED, error=GENERIC_ERROR_MESSAGE)
         else:
             update_job_status(request_id, JobStatus.FINISHED, result=flight.result)
     except asyncio.TimeoutError:
-        print(f"[Follower Timeout] Timeout waiting for leader on request {request_id}")
-        update_job_status(request_id, JobStatus.FAILED, error="Timeout chờ kết quả từ tác vụ xử lý chính.")
+        logger.error(f"[Follower Timeout] Timeout waiting for leader on request {request_id}")
+        update_job_status(request_id, JobStatus.FAILED, error=GENERIC_ERROR_MESSAGE)
     except Exception as exc:
-        print(f"[Follower Error] Error waiting for leader on request {request_id}: {exc}")
-        update_job_status(request_id, JobStatus.FAILED, error=f"Lỗi theo dõi: {str(exc)}")
+        # BUG-1120: Ghi chi tiết exception vào server log, không lưu chuỗi exception cụ thể vào lỗi job
+        logger.error(f"[Follower Error] Error waiting for leader on request {request_id}: {exc}", exc_info=True)
+        update_job_status(request_id, JobStatus.FAILED, error=GENERIC_ERROR_MESSAGE)
 
 
 # ---------------------------------------------------------------------------
@@ -491,8 +500,8 @@ def validate_pdf_content(file_bytes: bytes) -> Tuple[bool, str]:
         if kind is None or kind.mime != "application/pdf":
             return False, f"Chữ ký nhị phân không khớp định dạng PDF (nhận diện: {recognized})"
     except Exception as exc:
-        logger.warning(f"Lỗi kiểm tra filetype: {exc}")
-        return False, f"Lỗi phân tích chữ ký tệp tin: {exc}"
+        logger.warning(f"Lỗi kiểm tra filetype: {exc}", exc_info=True)
+        return False, "Lỗi phân tích chữ ký tệp tin"
 
     # 4. Tầng 3 (pypdf - BSD 3-Clause): Xác thực cấu trúc tối thiểu (không parse text stream để chống DoS)
     try:
@@ -500,8 +509,8 @@ def validate_pdf_content(file_bytes: bytes) -> Tuple[bool, str]:
         if len(reader.pages) == 0:
             return False, "Tài liệu PDF không có trang nào"
     except Exception as exc:
-        logger.warning(f"Lỗi kiểm tra cấu trúc pypdf: {exc}")
-        return False, f"Cấu trúc tệp PDF bị lỗi hoặc không thể đọc: {exc}"
+        logger.warning(f"Lỗi kiểm tra cấu trúc pypdf: {exc}", exc_info=True)
+        return False, "Cấu trúc tệp PDF bị lỗi hoặc không thể đọc"
 
     return True, "Valid"
 
@@ -851,6 +860,22 @@ async def add_process_time_header(request: Request, call_next):
     return response
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """
+    BUG-1120: Bắt mọi exception không được xử lý (Internal Server Error 500).
+    Ghi chi tiết exception và stack trace vào log máy chủ, chỉ trả về thông báo chung chung cho client.
+    """
+    logger.error(
+        f"[Internal Server Error] Unhandled exception on {request.method} {request.url.path}: {exc}",
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": GENERIC_ERROR_MESSAGE},
+    )
+
+
 def _extract_org_names_from_kien_nghi(kien_nghi_list: list) -> list[str]:
     """Trích xuất danh sách tên đơn vị nhận duy nhất từ danh sách kiến nghị."""
     seen = set()
@@ -1040,11 +1065,18 @@ def get_extract_status(
             detail="Không có quyền truy cập: Bạn không phải người khởi tạo tác vụ này",
         )
 
+    # BUG-1120: Chỉ trả về thông báo chung chung khi gặp lỗi, không lộ chuỗi exception
+    status_val = job["status"]
+    raw_error = job.get("error")
+    sanitized_error = None
+    if status_val == JobStatus.FAILED or raw_error is not None:
+        sanitized_error = GENERIC_ERROR_MESSAGE
+
     return ExtractResponse(
         request_id=job["request_id"],
-        status=job["status"],
+        status=status_val,
         result=KienNghiTongHop(**job["result"]) if job["result"] else None,
-        error=job["error"],
+        error=sanitized_error,
     )
 
 

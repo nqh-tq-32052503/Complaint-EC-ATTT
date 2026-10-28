@@ -42,10 +42,15 @@ def isolated_job_store(monkeypatch):
         return in_memory_db.get(request_id)
 
     def mock_update_job_status(request_id: str, status, result=None, error=None):
-        if request_id in in_memory_db:
-            in_memory_db[request_id]["status"] = status
-            in_memory_db[request_id]["result"] = result
-            in_memory_db[request_id]["error"] = error
+        status_enum = status if isinstance(status, app.JobStatus) else app.JobStatus(status)
+        sanitized_error = app.GENERIC_ERROR_MESSAGE if (error is not None or status_enum == app.JobStatus.FAILED) else None
+        if request_id not in in_memory_db:
+            in_memory_db[request_id] = {
+                "request_id": request_id,
+            }
+        in_memory_db[request_id]["status"] = status_enum
+        in_memory_db[request_id]["result"] = result
+        in_memory_db[request_id]["error"] = sanitized_error
 
     def mock_sync_get_json(key, bucket_name=None):
         return in_memory_minio.get(key)
