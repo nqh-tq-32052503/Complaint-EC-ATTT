@@ -9,7 +9,7 @@ Response schema của endpoint /extract tuân thủ 100% file schema_2608.json
 
 Chạy thử:
     pip install fastapi "pydantic>=2" uvicorn
-    # Xem docs tự sinh tại http://127.0.0.1:8000/docs
+    # API documentation mặc định tắt; bật bằng API_DOCS_ENABLED=true khi phát triển
 """
 
 from __future__ import annotations
@@ -800,10 +800,16 @@ def save_logs_to_minio(
 # 4. FastAPI app
 # ---------------------------------------------------------------------------
 
+# BUG-1122: Chỉ bật tài liệu API khi được cho phép rõ ràng (mặc định tắt).
+API_DOCS_ENABLED = os.environ.get("API_DOCS_ENABLED", "false").strip().lower() == "true"
+
 app = FastAPI(
     title="Kien Nghi Extraction & Classification API",
     description="Trích xuất và phân loại kiến nghị cử tri theo cơ quan thẩm quyền",
     version="1.0.0",
+    docs_url="/docs" if API_DOCS_ENABLED else None,
+    redoc_url="/redoc" if API_DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if API_DOCS_ENABLED else None,
 )
 
 
@@ -1108,4 +1114,5 @@ if __name__ == "__main__":
 
     host = os.environ.get("APP_HOST", "127.0.0.1")
     port = int(os.environ.get("APP_PORT", "8077"))
-    uvicorn.run("app:app", host=host, port=port, reload=True)
+    # BUG-1122: Không bật auto-reload trên môi trường vận hành.
+    uvicorn.run("app:app", host=host, port=port, reload=False)
